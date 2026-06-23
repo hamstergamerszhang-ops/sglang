@@ -103,7 +103,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -131,6 +130,9 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
+    NgramEmbeddingManager,
+)
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
     MemoryPoolConfig,
 )
