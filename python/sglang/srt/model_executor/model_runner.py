@@ -40,8 +40,8 @@ from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     bootstrap,
     get_tp_group,
+    get_world_group,
 )
-from sglang.srt.distributed.bootstrap import init_torch_distributed
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
@@ -75,7 +75,7 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
@@ -90,11 +90,11 @@ from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
-from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -109,6 +109,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.model_runner_components import quantization_checks
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
     configure_aux_hidden_state_capture,
@@ -150,9 +151,6 @@ from sglang.srt.model_executor.model_runner_components.pool_configurator import 
 )
 from sglang.srt.model_executor.model_runner_components.pp_proxy import (
     resolve_pp_proxy_topk_size,
-)
-from sglang.srt.model_executor.model_runner_components.quantization_checks import (
-    check_quantized_moe_compatibility,
 )
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
@@ -202,12 +200,12 @@ from sglang.srt.utils import (
     get_device_memory_capacity,
     is_host_cpu_arm64,
     is_npu,
+    numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -310,7 +308,7 @@ class ModelRunner:
 
         self.init_remote_instance_weight_transport()
 
-        self.msprobe_debugger = create_msprobe_debugger(server_args)
+        self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
@@ -345,9 +343,7 @@ class ModelRunner:
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
-            self.local_omp_cpuid = init_threads_binding(
-                tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
-            )
+            self.init_threads_binding()
 
         # Set float32 matmul precision
         if get_server_args().enable_tf32_matmul:
@@ -355,24 +351,10 @@ class ModelRunner:
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        result = init_torch_distributed(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            device=self.device,
-            ps=self.ps,
-            dist_port=self.dist_port,
-            is_draft_worker=self.is_draft_worker,
-            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
-        )
-        self.tp_group = result.tp_group
-        self.pp_group = result.pp_group
-        self.attention_tp_group = result.attention_tp_group
-        self.pre_model_load_memory = result.pre_model_load_memory
+        self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
-        maybe_init_shared_mooncake_transfer_engine(
-            server_args=self.server_args, gpu_id=self.gpu_id
-        )
+        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -404,12 +386,7 @@ class ModelRunner:
 
         # Load model weights and configure
         self.initialize()
-        check_quantized_moe_compatibility(
-            model_config=self.model_config,
-            tp_size=self.ps.tp_size,
-            moe_ep_size=self.ps.moe_ep_size,
-            moe_dp_size=self.ps.moe_dp_size,
-        )
+        self.check_quantized_moe_compatibility()
 
         if (
             self.server_args.elastic_ep_backend is not None
@@ -439,6 +416,74 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+    def init_msprobe(self):
+        self.msprobe_debugger = create_msprobe_debugger(self.server_args)
+
+    def init_threads_binding(self):
+        self.local_omp_cpuid = numa_utils.init_threads_binding(
+            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
+        )
+
+    def init_torch_distributed(self):
+        result = bootstrap.init_torch_distributed(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            device=self.device,
+            ps=self.ps,
+            dist_port=self.dist_port,
+            is_draft_worker=self.is_draft_worker,
+            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+        )
+        self.tp_group = result.tp_group
+        self.pp_group = result.pp_group
+        self.attention_tp_group = result.attention_tp_group
+        self.pre_model_load_memory = result.pre_model_load_memory
+
+    def init_shared_mooncake_transfer_engine(self):
+        maybe_init_shared_mooncake_transfer_engine(
+            server_args=self.server_args, gpu_id=self.gpu_id
+        )
+
+    def check_quantized_moe_compatibility(self):
+        quantization_checks.check_quantized_moe_compatibility(
+            model_config=self.model_config,
+            tp_size=self.ps.tp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_dp_size=self.ps.moe_dp_size,
+        )
+
+    def apply_torch_tp(self):
+        model_parallel.apply_torch_tp(
+            model=self.model, device=self.device, tp_size=self.ps.tp_size
+        )
+
+    def configure_kv_cache_dtype(self):
+        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+            kv_cache_dtype.configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                model=self.model,
+                model_dtype=self.dtype,
+            )
+        )
+        if resolved_kv_cache_dtype is not None:
+            self._record_kv_cache_dtype(resolved_kv_cache_dtype)
+
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.kv_cache_dtype != self.dtype
+        ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
+            self.kv_cache_dtype = self.dtype
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -524,57 +569,14 @@ class ModelRunner:
             )
 
     def initialize(self):
-        server_args = self.server_args
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_weight_transport.init_engine()
-
-        if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(
-                    server_args=server_args,
-                    model_config=self.model_config,
-                    moe_ep_rank=self.ps.moe_ep_rank,
-                )
-            )
-            if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
-                logger.info(
-                    "Initial expert_location_metadata:\n%s",
-                    format_expert_location_layout(
-                        get_global_expert_location_metadata()
-                    ),
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.ps.tp_rank,
-                )
-            )
-
-        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            init_lplb_solvers(model_config=self.model_config)
-
-        # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
+        self.init_memory_saver_adapter()
+        self.maybe_init_remote_instance_transfer_engine()
+        self.maybe_init_expert_location_metadata()
+        self.maybe_init_lplb_solvers()
+        self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
-
-        if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
-        self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=server_args,
-            vocab_size=self.model_config.vocab_size,
-        )
-        # Load the model
+        self.maybe_init_elastic_ep()
+        self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
         prepare_moe_topk(
@@ -584,13 +586,83 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
-
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
+        self.maybe_init_expert_backup_client()
+        self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
+        self.layer_info: ModelLayerInfo = resolve_layer_indices(
+            model=self.model,
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
+        adjust_hybrid_swa_layer_ids(
+            model_config=self.model_config,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            is_hybrid_swa=self.is_hybrid_swa,
+        )
+        self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_lora_manager()
+        self.maybe_enable_batch_invariant_mode()
+        self.configure_kv_cache_dtype()
 
-        # Load the expert backup client
+    def init_memory_saver_adapter(self):
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
+        )
+
+    def maybe_init_remote_instance_transfer_engine(self):
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            self.remote_instance_weight_transport.init_engine()
+
+    def maybe_init_expert_location_metadata(self):
+        if self.is_draft_worker:
+            return
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                moe_ep_rank=self.ps.moe_ep_rank,
+            )
+        )
+        if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
+            logger.info(
+                "Initial expert_location_metadata:\n%s",
+                format_expert_location_layout(get_global_expert_location_metadata()),
+            )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=self.ps.tp_rank,
+            )
+        )
+
+    def maybe_init_lplb_solvers(self):
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+            init_lplb_solvers(model_config=self.model_config)
+
+    def maybe_init_eplb_manager(self):
+        self.eplb_manager = (
+            EPLBManager(self)
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
+            else None
+        )
+
+    def maybe_init_elastic_ep(self):
+        if self.server_args.elastic_ep_backend:
+            ElasticEPStateManager.init(self.server_args)
+
+    def init_token_oracle(self):
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=self.server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
+
+    def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
             if (
@@ -600,53 +672,24 @@ class ModelRunner:
             else None
         )
 
-        self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
-
-        self.layer_info: ModelLayerInfo = resolve_layer_indices(
-            model=self.model,
-            model_config=self.model_config,
-            is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
-        )
-
-        adjust_hybrid_swa_layer_ids(
-            model_config=self.model_config,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_hybrid_swa=self.is_hybrid_swa,
-        )
-
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
+    def maybe_apply_post_load_model_transforms(self):
         # In layered loading, torchao may have been applied
+        torchao_applied = getattr(self.model, "torchao_applied", False)
         if not torchao_applied:
             apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
-
-        # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
-            apply_torch_tp(
-                model=self.model, device=self.device, tp_size=self.ps.tp_size
-            )
+            self.apply_torch_tp()
 
-        # Init lora
-        if server_args.enable_lora:
+    def maybe_init_lora_manager(self):
+        if self.server_args.enable_lora:
             self.init_lora_manager()
 
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
+    def maybe_enable_batch_invariant_mode(self):
+        if self.server_args.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-
-        # Deduce KV cache dtype
-        resolved_kv_cache_dtype, self.kv_cache_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-            model=self.model,
-            model_dtype=self.dtype,
-        )
-        if resolved_kv_cache_dtype is not None:
-            self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return resolve_pp_proxy_topk_size(
@@ -980,33 +1023,37 @@ class ModelRunner:
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
 
-        if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            hisparse_top_k = getattr(
-                self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-            )
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-                swap_in_block_size=hisparse_cfg.swap_in_block_size,
-            )
+        self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+
+    def maybe_init_hisparse_coordinator(self):
+        if not self.enable_hisparse:
+            return
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_top_k = getattr(
+            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+        )
+        self.hisparse_coordinator = HiSparseCoordinator(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            top_k=hisparse_top_k,
+            device_buffer_size=hisparse_cfg.device_buffer_size,
+            device=self.device,
+            tp_group=(
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
+            ),
+            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            swap_in_block_size=hisparse_cfg.swap_in_block_size,
+        )
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
