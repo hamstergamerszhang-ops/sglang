@@ -50,9 +50,10 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    get_healthy_expert_location_src_rank,
     join_process_groups,
+    maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
-    rebroadcast_expert_location_metadata,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -64,6 +65,7 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
+    broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
@@ -452,7 +454,12 @@ class ModelRunner:
             and self.server_args.elastic_ep_rejoin
         ):
             join_process_groups()
-            rebroadcast_expert_location_metadata(invoked_in_elastic_ep_rejoin_path=True)
+            broadcast_global_expert_location_metadata(
+                src_rank=get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            )
+            ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -1732,17 +1739,7 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
-            elastic_ep_state.snapshot_active_to_last()
-            elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
-            gen = self.eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
+        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
