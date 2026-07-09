@@ -86,6 +86,15 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 _is_npu = is_npu()
 
+
+def _should_enable_lazy_compaction() -> bool:
+    """Lazy compaction default — ON unless
+    `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
+    Centralized here so both unified-memory-pool factory call sites stay in sync.
+    """
+    return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
+
+
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
@@ -94,6 +103,10 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        UnifiedKVPool,
+        UnifiedPoolBundle,
+    )
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
     )
@@ -116,6 +129,14 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
+    unified_memory_pool: Optional[UnifiedKVPool] = None
+
+
+class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: KVCache
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
 class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
@@ -175,6 +196,7 @@ class KVCacheConfigurator:
     start_layer: int
     end_layer: int
     num_effective_layers: int
+    forward_stream: Any
     # optional pre-injection (draft worker reuses target's pool)
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
@@ -205,12 +227,10 @@ class KVCacheConfigurator:
 
         sizes = self._derive_pool_sizes(config=config)
 
-        req_to_token_pool, token_to_kv_pool, token_to_kv_pool_allocator = (
-            self._init_pools(
-                sizes=sizes,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            )
+        pools = self._init_pools(
+            sizes=sizes,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
         logger.info(
@@ -223,10 +243,11 @@ class KVCacheConfigurator:
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
             swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            req_to_token_pool=pools.req_to_token_pool,
+            token_to_kv_pool=pools.token_to_kv_pool,
+            token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
             memory_pool_config=config,
+            unified_memory_pool=pools.unified_memory_pool,
         )
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
@@ -278,9 +299,45 @@ class KVCacheConfigurator:
         sizes: _PoolSizes,
         req_to_token_pool: Optional[ReqToTokenPool],
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
-    ) -> tuple[ReqToTokenPool, KVCache, BaseTokenToKVPoolAllocator]:
+    ) -> _InitializedPools:
         """Initialize the memory pools."""
         token_to_kv_pool = None
+
+        # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
+        # from one byte buffer, then return. Gated to the target worker
+        # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
+        if (
+            self.server_args.enable_unified_memory
+            and self.server_args.disaggregation_mode == "null"
+            and req_to_token_pool is None
+        ):
+            if self.mambaish_config is not None:
+                bundle = self._init_unified_mamba_pools(
+                    max_num_reqs=sizes.max_running_requests,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
+                bundle = self._init_unified_swa_pools(
+                    max_num_reqs=sizes.max_running_requests,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                )
+            else:
+                # Fail loud, not silently fall through to the normal pools (which would
+                # leave the flag a no-op). The feature replaces the HYBRID pools only.
+                raise ValueError(
+                    "--enable-unified-memory only supports hybrid Mamba and "
+                    "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "
+                    f"the current model ({self.model_config.hf_config.architectures}) "
+                    "is neither, so the unified memory pool cannot be built. Drop "
+                    "--enable-unified-memory for this model."
+                )
+            return _InitializedPools(
+                req_to_token_pool=bundle.req_to_token_pool,
+                token_to_kv_pool=bundle.token_to_kv_pool,
+                token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+                unified_memory_pool=bundle.unified_memory_pool,
+            )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -332,7 +389,171 @@ class KVCacheConfigurator:
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype != fp4_e2m1."
             )
-        return req_to_token_pool, token_to_kv_pool, token_to_kv_pool_allocator
+        return _InitializedPools(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=token_to_kv_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    def _init_unified_mamba_pools(
+        self, *, max_num_reqs: int, max_total_num_tokens: int
+    ) -> UnifiedPoolBundle:
+        """Build the shared-KV-pool stack for a hybrid-Mamba model:
+        one byte buffer split between the full-attn MHA KV pool and the
+        per-request Mamba state pool, with virtual slot ids above the
+        allocator."""
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_pools
+
+        config = self.mambaish_config
+        assert config is not None
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
+        # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
+        # the mamba sub-pool stays page=1.
+        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
+        mamba_layer_ids = [
+            i
+            for i in config.mamba2_cache_params.layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+
+        bundle = init_unified_mamba_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            page_size=self.page_size,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            is_draft_worker=self.is_draft_worker,
+            use_mla_backend=self.use_mla_backend,
+            mamba_layer_ids=mamba_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            mamba2_cache_params=config.mamba2_cache_params,
+            model_context_len=self.model_config.context_len,
+            extra_max_context_len=extra_max_context_len,
+            max_total_num_tokens=max_total_num_tokens,
+            max_mamba_cache_size=self.server_args.max_mamba_cache_size,
+            max_num_reqs=max_num_reqs,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
+            # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
+            # barrier so eager compaction serializes after the in-flight forward's
+            # v2p/KV reads. Near-no-op in normal mode.
+            forward_stream=self.forward_stream,
+            # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
+            lazy_compaction=_should_enable_lazy_compaction(),
+        )
+        return bundle
+
+    def _init_unified_swa_pools(
+        self,
+        *,
+        max_num_reqs: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> UnifiedPoolBundle:
+        """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
+        buffer split between the full-attention and SWA KV pools."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedPoolBundle,
+            init_unified_swa_pools,
+        )
+
+        assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
+        # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
+        # once in virtual space and binds the new pages on both sub-allocators.
+        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        req_to_token_pool = ReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+        )
+
+        head_num = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        head_dim = self.model_config.head_dim
+        if self.is_hybrid_swa_compress:
+            # Asymmetric head dims between full and SWA (NPU compress path):
+            # pull SWA-specific dims from the hf text config.
+            v_head_dim = self.model_config.hf_text_config.v_head_dim
+            swa_head_num = max(
+                1,
+                self.model_config.hf_text_config.swa_num_key_value_heads
+                // get_parallel().attn_tp_size,
+            )
+            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
+            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
+        else:
+            v_head_dim = head_dim
+            swa_head_num = head_num
+            swa_head_dim = head_dim
+            swa_v_head_dim = head_dim
+
+        # Filter layer ids to this worker's [start_layer, end_layer) range.
+        swa_attention_layer_ids = [
+            i
+            for i in self.model_config.swa_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in self.model_config.full_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+
+        bundle = init_unified_swa_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            page_size=self.page_size,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            # Overlap mode: same wait_stream(forward_stream) rationale as
+            # `_init_unified_mamba_pools`.
+            forward_stream=self.forward_stream,
+            # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
+            lazy_compaction=_should_enable_lazy_compaction(),
+        )
+        return UnifiedPoolBundle(
+            unified_memory_pool=bundle.unified_memory_pool,
+            token_to_kv_pool=bundle.token_to_kv_pool,
+            token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            req_to_token_pool=req_to_token_pool,
+        )
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self,
@@ -1281,7 +1502,7 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def _resolve_max_num_reqs(self, token_capacity: int) -> int:
+    def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
@@ -1329,8 +1550,8 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self._config_from_budget(available_bytes)
-        config.max_running_requests = self._resolve_max_num_reqs(
+        config = self.config_from_budget(available_bytes)
+        config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
         configurator = create_memory_pool_configurator(self)
@@ -1338,7 +1559,7 @@ class KVCacheConfigurator:
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
-    def _config_from_budget(
+    def config_from_budget(
         self, budget_bytes: int, *, cap_tokens: Optional[int] = None
     ) -> MemoryPoolConfig:
         """Turn a KV byte budget into a pool config via the configurator, re-applying

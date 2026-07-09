@@ -225,9 +225,6 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.model_runner import (
-    post_capture_resize_kv_pool,
-)
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -849,7 +846,7 @@ class Scheduler(
 
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
-            post_capture_resize_kv_pool(model_runner)
+            model_runner.resize_kv_pool_after_capture()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
