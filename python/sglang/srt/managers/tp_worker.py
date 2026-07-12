@@ -42,7 +42,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+from sglang.srt.model_executor.pool_configurator import (
     MemoryPoolConfig,
 )
 from sglang.srt.server_args import ServerArgs

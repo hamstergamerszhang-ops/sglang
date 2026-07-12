@@ -110,11 +110,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
     )
-    from sglang.srt.model_executor.model_runner_components.pool_configurator import (
-        MemoryPoolConfig,
-    )
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
+    )
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
     )
 
 
@@ -1542,7 +1542,7 @@ class KVCacheConfigurator:
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
-        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
 
@@ -1563,7 +1563,7 @@ class KVCacheConfigurator:
         the external token constraints (user cap, page alignment, PP sync) and the
         optional ``cap_tokens`` clamp."""
         # Local import avoids a pool_configurator import cycle.
-        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
 

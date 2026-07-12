@@ -158,6 +158,9 @@ from sglang.srt.model_executor.model_runner_components.weight_exporter import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
+from sglang.srt.model_executor.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,

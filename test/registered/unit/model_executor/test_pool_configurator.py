@@ -174,7 +174,7 @@ class TestDefaultConfigurator(unittest.TestCase):
     def _run(self, available_bytes, page_size=1, **kwargs):
         mr = _make_model_runner(page_size=page_size, **kwargs)
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -230,7 +230,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
     def _run(self, available_bytes, **kwargs):
         mr = self._make_swa_runner(**kwargs)
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -324,7 +324,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=True,  # spec-v1: no double allocation
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -363,7 +363,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=False,  # spec-v2: 2 * get_alloc_len_per_decode
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -389,7 +389,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disaggregation_mode="decode",
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -420,7 +420,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disable_overlap_schedule=False,  # overlap -> 2 chunks in flight
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -452,7 +452,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             disaggregation_decode_extra_slots=2,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -480,7 +480,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
             **kwargs,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -530,7 +530,7 @@ class TestEagleConfigurator(unittest.TestCase):
         mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
 
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
 
@@ -547,7 +547,7 @@ class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
                 create_memory_pool_configurator,
             )
@@ -563,7 +563,7 @@ class TestFactory(unittest.TestCase):
             swa_num_kv_heads=4,
         )
         with mock_cpu_env():
-            from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            from sglang.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,
                 create_memory_pool_configurator,
             )
@@ -585,13 +585,13 @@ class TestFactory(unittest.TestCase):
                 max_running_requests=max_running_requests,
             )
             with mock_cpu_env():
-                from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+                from sglang.srt.model_executor.pool_configurator import (
                     create_memory_pool_configurator,
                 )
 
                 return create_memory_pool_configurator(mr)
 
-        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        from sglang.srt.model_executor.pool_configurator import (
             SWAChunkCapPoolConfigurator,
         )
 
