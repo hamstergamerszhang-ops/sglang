@@ -467,7 +467,13 @@ class ModelRunner:
         )
 
     def init_weight_exporter(self):
-        self.weight_exporter = WeightExporter(_model_runner=self)
+        self.weight_exporter = WeightExporter(
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            gpu_id=self.gpu_id,
+            get_model_path=lambda: self.model_config.model_path,
+            get_model=lambda: self.model,
+        )
 
     def init_remote_instance_weight_transport(self):
         self.remote_instance_weight_transport = RemoteInstanceWeightTransport(
