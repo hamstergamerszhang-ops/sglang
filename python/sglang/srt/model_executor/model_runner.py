@@ -145,9 +145,6 @@ from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
-from sglang.srt.model_executor.model_runner_components.pool_configurator import (
-    MemoryPoolConfig,
-)
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
 )
@@ -521,15 +518,12 @@ class ModelRunner:
                 server_args=self.server_args, is_draft_worker=self.is_draft_worker
             ),
             spec_aux_config=self.spec_aux_config,
-            dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
             mambaish_config=mambaish_config(self.model_config),
             hybrid_gdn_config=hybrid_gdn_config(self.model_config),
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            num_effective_layers=self.layer_info.num_effective_layers,
+            layer_info=self.layer_info,
             forward_stream=self.forward_stream,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
