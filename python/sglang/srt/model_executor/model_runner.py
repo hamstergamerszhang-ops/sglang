@@ -787,6 +787,14 @@ class ModelRunner:
                     resize.capped_max_running_requests
                 )
 
+    @property
+    def effective_max_total_num_tokens(self):
+        """Return the max token pool size considering hybrid swa settings."""
+        if self.is_hybrid_swa:
+            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+        else:
+            return self.max_total_num_tokens
+
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
