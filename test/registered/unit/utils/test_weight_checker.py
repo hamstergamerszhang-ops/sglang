@@ -495,7 +495,8 @@ class _WeightCheckerTestBase(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
-        self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
+        runner = _FakeModelRunner(self.model)
+        self.checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
 
 
 class TestSnapshot(_WeightCheckerTestBase):
@@ -702,7 +703,9 @@ class _ChecksumTestBase(CustomTestCase):
             pp_rank=0,
             pp_size=1,
         )
-        self.checker = WeightChecker(model_runner=self.runner)
+        self.checker = WeightChecker(
+            get_model=lambda: self.runner.model, ps=self.runner.ps
+        )
 
 
 class TestComputeChecksum(_ChecksumTestBase):
