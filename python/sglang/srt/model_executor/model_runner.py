@@ -137,6 +137,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
     init_lplb_solvers,
     prepare_moe_topk,
 )
@@ -427,7 +428,7 @@ class ModelRunner:
         )
 
     def check_quantized_moe_compatibility(self):
-        misc_utils.check_quantized_moe_compatibility(
+        check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
