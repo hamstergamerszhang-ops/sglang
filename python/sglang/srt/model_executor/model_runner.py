@@ -38,12 +38,10 @@ from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     bootstrap,
-    get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -79,9 +77,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.model_parallel import apply_torch_tp
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -165,7 +160,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -1004,15 +998,6 @@ class ModelRunner:
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
-    @property
-    def max_token_pool_size(self):
-        """Return the max token pool size considering hybrid swa settings."""
-        if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
-        else:
-            return self.max_total_num_tokens
-
-
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # Load-time resolution transition: the weight-resolved kv-cache dtype
         # is declared into the flags tier; the dual-apply inside the helper
@@ -1508,7 +1493,6 @@ class ModelRunner:
         load_format: str,
         load_config: LoadConfig,
     ) -> None:
-        """Commit a newly-loaded model and its provenance (post-load hook)."""
         self.model = new_model
         self.server_args.override(
             "model_runner.update_model_fields",
